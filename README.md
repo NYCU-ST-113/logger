@@ -52,16 +52,16 @@ Follow these steps to set up and run the Logger Service on your local machine.
 Start the Logger Service with:
 
 ```bash
-uvicorn logger_service.main:app --reload --port 8002
+uvicorn logger_service.main:app --reload --port 7000
 ```
 
-The service will be available at `http://localhost:8002`.
+The service will be available at `http://localhost:7000`.
 
 ## API Documentation
 
 Once the service is running, you can access the API documentation at:
-- Swagger UI: `http://localhost:8002/docs`
-- ReDoc: `http://localhost:8002/redoc`
+- Swagger UI: `http://localhost:7000/docs`
+- ReDoc: `http://localhost:7000/redoc`
 
 ## Features
 
