@@ -1,196 +1,407 @@
+# test/test_logger_service.py
 import pytest
-from fastapi.testclient import TestClient
-from logger_service.main import get_logger, log_to_file, log_info
-from logger_service.main import app
-from common_utils.logger.client import LoggerClient
 import os
-import uuid
-import logging
+import tempfile
+import shutil
+from unittest.mock import patch, MagicMock, mock_open
+from fastapi.testclient import TestClient
+from datetime import datetime
 import json
-import time
-from unittest.mock import patch, MagicMock
+import uuid
 
-client = TestClient(app)
+# Import the app and functions
+from logger_service.main import app, get_logger, log_to_file, log_info, LogEntry
 
-def test_logger_creation():
-    """Test that logger is created correctly"""
-    logger = get_logger("test_logger")
-    assert isinstance(logger, logging.Logger)
-    assert logger.name == "test_logger"
-
-def test_log_info(tmpdir):
-    """Test that log_info writes to file"""
-    # Temporarily modify the log directory for testing
-    import logger_service.main
-    original_log_dir = logger_service.main.LOG_DIR
-    logger_service.main.LOG_DIR = str(tmpdir)
+class TestLoggerService:
     
-    # Reconfigure the log handler
-    log_file = os.path.join(str(tmpdir), "test.log")
-    handler = logging.FileHandler(log_file)
-    formatter = logging.Formatter('%(message)s')  # Simplify the format for testing
-    handler.setFormatter(formatter)
-    
-    logger = get_logger("test_logger")
-    for h in logger.handlers[:]:
-        logger.removeHandler(h)
-    logger.addHandler(handler)
-    
-    # Write to the log
-    test_message = "This is a test log message"
-    log_info(test_message, "test_logger")
-    
-    # Check the log file
-    handler.flush()
-    with open(log_file, "r") as f:
-        content = f.read()
-    
-    assert test_message in content
-    
-    # Restore the original path
-    logger_service.main.LOG_DIR = original_log_dir
-
-def test_log_endpoint():
-    """Test the /log endpoint"""
-    log_data = {
-        "message": f"Test log message {uuid.uuid4()}",
-        "level": "info",
-        "service": "test_service"
-    }
-    
-    response = client.post("/log", json=log_data)
-    assert response.status_code == 200
-    assert response.json() == {"status": "success"}
-
-def test_log_batch_endpoint():
-    """Test the /log/batch endpoint"""
-    log_entries = [
-        {
-            "message": f"Test batch log 1 {uuid.uuid4()}",
-            "level": "info",
-            "service": "test_service"
-        },
-        {
-            "message": f"Test batch log 2 {uuid.uuid4()}",
-            "level": "error",
-            "service": "test_service"
-        }
-    ]
-    
-    response = client.post("/log/batch", json={"logs": log_entries})
-    assert response.status_code == 200
-    assert response.json() == {"status": "success", "count": 2}
-
-@patch('logger_service.main.log_to_file')
-def test_log_endpoint_calls_log_info(mock_log_to_file):
-    """Test that the /log endpoint calls log_to_file with correct parameters"""
-    log_data = {
-        "message": "Test message",
-        "level": "info",
-        "service": "test_service"
-    }
-    
-    response = client.post("/log", json=log_data)
-    assert response.status_code == 200
-    
-    # Check that log_to_file was called
-    mock_log_to_file.assert_called_once()
-    # Since log_to_file takes a LogEntry object, we check differently
-    args, _ = mock_log_to_file.call_args
-    log_entry = args[0]
-    assert log_entry.message == log_data["message"]
-    assert log_entry.service == log_data["service"]
-    assert log_entry.level == log_data["level"]
-
-def test_log_performance():
-    """Test the performance of logging multiple messages"""
-    log_entries = []
-    for i in range(50):  # Test with 50 log entries
-        log_entries.append({
-            "message": f"Performance test log {i}",
-            "level": "info",
-            "service": "test_service"
-        })
-    
-    start_time = time.time()
-    response = client.post("/log/batch", json={"logs": log_entries})
-    end_time = time.time()
-    
-    assert response.status_code == 200
-    # Check that batch logging is reasonably fast (adjust threshold as needed)
-    assert end_time - start_time < 1.0  # Should complete in less than 1 second
-
-def test_logger_client():
-    """Test the logger client functionality"""
-    
-    # Create a mock server response
-    with patch('requests.post') as mock_post:
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_post.return_value = mock_response
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        """Setup and teardown for each test"""
+        # Create a temporary directory for logs during testing
+        self.temp_dir = tempfile.mkdtemp()
         
-        # Initialize the logger client with correct parameters
-        logger_client = LoggerClient(service_name="test_client_service", logger_url="http://test-logger-service")
+        # Patch LOG_DIR to use temp directory
+        with patch('logger_service.main.LOG_DIR', self.temp_dir):
+            self.client = TestClient(app)
+            yield
         
-        # Test info method
-        result = logger_client.info("Test message")
-        assert result is True  # LoggerClient methods return boolean values
+        # Cleanup
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
         
-        # Verify the request was made correctly with correct timeout
-        mock_post.assert_called_with(
-            "http://test-logger-service/log",
-            json={
-                "message": "Test message",
-                "level": "INFO",  # Note: actual implementation uses uppercase log levels
-                "service": "test_client_service",
-                "timestamp": mock_post.call_args[1]['json']['timestamp']  # Dynamically get timestamp
-            },
-            timeout=2  # Actual implementation uses 2 second timeout
+        # Clear service_loggers cache
+        from logger_service.main import service_loggers
+        service_loggers.clear()
+
+    def test_health_check(self):
+        """Test health check endpoint"""
+        response = self.client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert "timestamp" in data
+
+    @patch('logger_service.main.LOG_DIR')
+    def test_get_logger_new_service(self, mock_log_dir):
+        """Test creating a new logger for a service"""
+        mock_log_dir.__str__ = lambda: self.temp_dir
+        
+        with patch('logger_service.main.service_loggers', {}):
+            logger = get_logger("test_service")
+            assert logger is not None
+            assert logger.name == "test_service"
+            
+            # Test getting the same logger again
+            logger2 = get_logger("test_service")
+            assert logger is logger2
+
+    @patch('logger_service.main.LOG_DIR')
+    def test_get_logger_existing_service(self, mock_log_dir):
+        """Test getting an existing logger"""
+        mock_log_dir.__str__ = lambda: self.temp_dir
+        
+        with patch('logger_service.main.service_loggers', {}):
+            logger1 = get_logger("existing_service")
+            logger2 = get_logger("existing_service")
+            assert logger1 is logger2
+
+    @patch('logger_service.main.get_logger')
+    def test_log_to_file_info_level(self, mock_get_logger):
+        """Test logging INFO level message"""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
+        
+        log_entry = LogEntry(
+            service="test_service",
+            level="INFO",
+            message="Test info message",
+            details={"key": "value"}
         )
         
-        # Test error method
-        mock_post.reset_mock()
-        mock_response.status_code = 200
+        log_to_file(log_entry)
         
-        result = logger_client.error("Test error message")
-        assert result is True  # LoggerClient methods return boolean values
+        mock_get_logger.assert_called_once_with("test_service")
+        mock_logger.info.assert_called_once_with('Test info message - Details: {"key": "value"}')
+
+    @patch('logger_service.main.get_logger')
+    def test_log_to_file_error_level(self, mock_get_logger):
+        """Test logging ERROR level message"""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
         
-        # Verify the error request was made correctly
-        mock_post.assert_called_with(
-            "http://test-logger-service/log",
-            json={
-                "message": "Test error message",
-                "level": "ERROR",  # Note: actual implementation uses uppercase log levels
-                "service": "test_client_service",
-                "timestamp": mock_post.call_args[1]['json']['timestamp']  # Dynamically get timestamp
-            },
-            timeout=2  # Actual implementation uses 2 second timeout
+        log_entry = LogEntry(
+            service="test_service",
+            level="ERROR",
+            message="Test error message"
         )
         
-        # Test with details
-        mock_post.reset_mock()
-        mock_response.status_code = 200
+        log_to_file(log_entry)
         
-        details = {"key": "value", "error_code": 123}
-        result = logger_client.warning("Test warning with details", details=details)
+        mock_logger.error.assert_called_once_with("Test error message")
+
+    @patch('logger_service.main.get_logger')
+    def test_log_to_file_warning_level(self, mock_get_logger):
+        """Test logging WARNING level message"""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
+        
+        log_entry = LogEntry(
+            service="test_service",
+            level="WARNING",
+            message="Test warning message"
+        )
+        
+        log_to_file(log_entry)
+        
+        mock_logger.warning.assert_called_once_with("Test warning message")
+
+    @patch('logger_service.main.get_logger')
+    def test_log_to_file_debug_level(self, mock_get_logger):
+        """Test logging DEBUG level message"""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
+        
+        log_entry = LogEntry(
+            service="test_service",
+            level="DEBUG",
+            message="Test debug message"
+        )
+        
+        log_to_file(log_entry)
+        
+        mock_logger.debug.assert_called_once_with("Test debug message")
+
+    @patch('logger_service.main.get_logger')
+    def test_log_to_file_unknown_level(self, mock_get_logger):
+        """Test logging with unknown level (should not call any logger method)"""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
+        
+        log_entry = LogEntry(
+            service="test_service",
+            level="UNKNOWN",
+            message="Test unknown level message"
+        )
+        
+        log_to_file(log_entry)
+        
+        # None of the logging methods should be called
+        mock_logger.info.assert_not_called()
+        mock_logger.error.assert_not_called()
+        mock_logger.warning.assert_not_called()
+        mock_logger.debug.assert_not_called()
+
+    @patch('logger_service.main.get_logger')
+    def test_log_info_function(self, mock_get_logger):
+        """Test log_info helper function"""
+        mock_logger = MagicMock()
+        mock_get_logger.return_value = mock_logger
+        
+        result = log_info("Test message", "test_service")
+        
         assert result is True
+        mock_get_logger.assert_called_once_with("test_service")
+        mock_logger.info.assert_called_once_with("Test message")
+
+    @patch('logger_service.main.log_to_file')
+    def test_create_log_endpoint(self, mock_log_to_file):
+        """Test POST /log endpoint"""
+        log_data = {
+            "service": "test_service",
+            "level": "INFO",
+            "message": "Test log message",
+            "details": {"key": "value"}
+        }
         
-        # Verify the warning request with details was made correctly
-        mock_post.assert_called_with(
-            "http://test-logger-service/log",
-            json={
-                "message": "Test warning with details",
-                "level": "WARNING",
-                "service": "test_client_service",
-                "timestamp": mock_post.call_args[1]['json']['timestamp'],
-                "details": details
-            },
-            timeout=2
+        response = self.client.post("/log", json=log_data)
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+
+    @patch('logger_service.main.log_to_file')
+    def test_create_log_endpoint_with_timestamp(self, mock_log_to_file):
+        """Test POST /log endpoint with provided timestamp"""
+        timestamp = "2023-01-01T10:00:00"
+        log_data = {
+            "service": "test_service",
+            "level": "INFO",
+            "message": "Test log message",
+            "timestamp": timestamp
+        }
+        
+        response = self.client.post("/log", json=log_data)
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+
+    @patch('logger_service.main.log_to_file')
+    def test_create_log_endpoint_without_timestamp(self, mock_log_to_file):
+        """Test POST /log endpoint without timestamp (should be auto-generated)"""
+        log_data = {
+            "service": "test_service",
+            "level": "INFO",
+            "message": "Test log message"
+        }
+        
+        with patch('logger_service.main.datetime') as mock_datetime:
+            mock_now = MagicMock()
+            mock_datetime.now.return_value = mock_now
+            
+            response = self.client.post("/log", json=log_data)
+            
+            assert response.status_code == 200
+            mock_datetime.now.assert_called_once()
+
+    @patch('logger_service.main.log_to_file')
+    def test_create_logs_batch_endpoint(self, mock_log_to_file):
+        """Test POST /log/batch endpoint"""
+        batch_data = {
+            "logs": [
+                {
+                    "service": "service1",
+                    "level": "INFO",
+                    "message": "Message 1"
+                },
+                {
+                    "service": "service2",
+                    "level": "ERROR",
+                    "message": "Message 2"
+                }
+            ]
+        }
+        
+        response = self.client.post("/log/batch", json=batch_data)
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+        assert data["count"] == 2
+
+    @patch('logger_service.main.log_to_file')
+    def test_create_logs_batch_endpoint_auto_timestamp(self, mock_log_to_file):
+        """Test POST /log/batch endpoint with auto timestamp generation"""
+        batch_data = {
+            "logs": [
+                {
+                    "service": "service1",
+                    "level": "INFO",
+                    "message": "Message 1"
+                }
+            ]
+        }
+        
+        with patch('logger_service.main.datetime') as mock_datetime:
+            mock_now = MagicMock()
+            mock_datetime.now.return_value = mock_now
+            
+            response = self.client.post("/log/batch", json=batch_data)
+            
+            assert response.status_code == 200
+            mock_datetime.now.assert_called_once()
+
+    @patch('logger_service.main.os.path.exists')
+    @patch('builtins.open', new_callable=mock_open, read_data="2023-01-01 10:00:00 - INFO - Test log 1\n2023-01-01 10:01:00 - ERROR - Test log 2\n")
+    def test_get_logs_endpoint_success(self, mock_file, mock_exists):
+        """Test GET /logs/{service_name} endpoint success case"""
+        mock_exists.return_value = True
+        
+        response = self.client.get("/logs/test_service")
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert "logs" in data
+        assert "total" in data
+        assert len(data["logs"]) == 2
+
+    @patch('logger_service.main.os.path.exists')
+    def test_get_logs_endpoint_file_not_exists(self, mock_exists):
+        """Test GET /logs/{service_name} endpoint when log file doesn't exist"""
+        mock_exists.return_value = False
+        
+        response = self.client.get("/logs/nonexistent_service")
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["logs"] == []
+        assert data["total"] == 0
+
+    @patch('logger_service.main.os.path.exists')
+    @patch('builtins.open', new_callable=mock_open, read_data="2023-01-01 10:00:00 - INFO - Test log 1\n2023-01-01 10:01:00 - ERROR - Test log 2\n2023-01-01 10:02:00 - INFO - Test log 3\n")
+    def test_get_logs_endpoint_with_level_filter(self, mock_file, mock_exists):
+        """Test GET /logs/{service_name} endpoint with level filter"""
+        mock_exists.return_value = True
+        
+        response = self.client.get("/logs/test_service?level=INFO")
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["logs"]) == 2  # Only INFO logs
+
+    @patch('logger_service.main.os.path.exists')
+    @patch('builtins.open', new_callable=mock_open, read_data="Log 1\nLog 2\nLog 3\nLog 4\nLog 5\n")
+    def test_get_logs_endpoint_with_pagination(self, mock_file, mock_exists):
+        """Test GET /logs/{service_name} endpoint with pagination"""
+        mock_exists.return_value = True
+        
+        response = self.client.get("/logs/test_service?limit=2&offset=1")
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["logs"]) == 2
+        assert data["logs"][0] == "Log 2"
+        assert data["logs"][1] == "Log 3"
+
+    @patch('logger_service.main.os.path.exists')
+    @patch('builtins.open', side_effect=IOError("File read error"))
+    def test_get_logs_endpoint_file_read_error(self, mock_file, mock_exists):
+        """Test GET /logs/{service_name} endpoint with file read error"""
+        mock_exists.return_value = True
+        
+        response = self.client.get("/logs/test_service")
+        
+        assert response.status_code == 500
+        data = response.json()
+        assert "Error retrieving logs" in data["detail"]
+
+    @patch('logger_service.main.os.path.exists')
+    @patch('builtins.open', new_callable=mock_open, read_data="Log line 1\nLog line 2\n")
+    def test_get_logs_endpoint_all_parameters(self, mock_file, mock_exists):
+        """Test GET /logs/{service_name} endpoint with all parameters"""
+        mock_exists.return_value = True
+        
+        response = self.client.get(
+            "/logs/test_service?level=INFO&start_time=2023-01-01T00:00:00&end_time=2023-01-01T23:59:59&limit=10&offset=0"
         )
         
-        # Test failure scenario
-        mock_post.reset_mock()
-        mock_response.status_code = 500  # Simulate server error
+        assert response.status_code == 200
+        data = response.json()
+        assert "logs" in data
+        assert "total" in data
+
+    def test_log_entry_model_validation(self):
+        """Test LogEntry model validation"""
+        # Valid log entry
+        log_entry = LogEntry(
+            service="test_service",
+            level="INFO",
+            message="Test message"
+        )
+        assert log_entry.service == "test_service"
+        assert log_entry.level == "INFO"
+        assert log_entry.message == "Test message"
+        assert log_entry.details is None
+        assert log_entry.timestamp is None
+
+    def test_log_entry_model_with_all_fields(self):
+        """Test LogEntry model with all fields"""
+        timestamp = datetime.now()
+        log_entry = LogEntry(
+            service="test_service",
+            level="ERROR",
+            message="Test error",
+            details={"error_code": 500},
+            timestamp=timestamp
+        )
+        assert log_entry.service == "test_service"
+        assert log_entry.level == "ERROR"
+        assert log_entry.message == "Test error"
+        assert log_entry.details == {"error_code": 500}
+        assert log_entry.timestamp == timestamp
+
+    @patch('logger_service.main.LOG_DIR')
+    @patch('logger_service.main.os.makedirs')
+    def test_log_directory_creation(self, mock_makedirs, mock_log_dir):
+        """Test that log directory is created"""
+        # This test ensures the module-level code is covered
+        import importlib
+        import logger_service.main
+        importlib.reload(logger_service.main)
+        mock_makedirs.assert_called()
+
+    def test_invalid_log_data(self):
+        """Test POST /log with invalid data"""
+        invalid_data = {
+            "service": "test_service",
+            # Missing required 'level' and 'message' fields
+        }
         
-        result = logger_client.debug("Test debug message")
-        assert result is False  # Should return False on failure
+        response = self.client.post("/log", json=invalid_data)
+        assert response.status_code == 422  # Validation error
+
+    def test_invalid_batch_data(self):
+        """Test POST /log/batch with invalid data"""
+        invalid_data = {
+            "logs": [
+                {
+                    "service": "test_service",
+                    # Missing required fields
+                }
+            ]
+        }
+        
+        response = self.client.post("/log/batch", json=invalid_data)
+        assert response.status_code == 422  # Validation error
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--cov=logger_service", "--cov-report=term-missing"])

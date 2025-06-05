@@ -77,6 +77,11 @@ Run the tests with:
 python3 -m pytest test/test_logger.py -v
 ```
 
+For coverage report:
+```bash
+python3 -m pytest --cov=logger_service --cov-report=term-missing test/
+```
+
 ## Project Structure
 
 ```
